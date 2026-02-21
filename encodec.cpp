@@ -1,15 +1,6 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "ggml/src/ggml-impl.h"
-
-#ifdef GGML_USE_CUBLAS
-#include "ggml-cuda.h"
-#endif
-
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
 
 #include <cassert>
 #include <cmath>
@@ -98,27 +89,13 @@ struct encodec_model {
     std::map<std::string, struct ggml_tensor *> tensors;
 };
 
-struct encodec_ggml_cgraph_deleter {
-    void operator()(struct ggml_cgraph * cgraph) {
-        if (cgraph->nodes)
-            free(cgraph->nodes);
-        if (cgraph->leafs)
-            free(cgraph->leafs);
-        if (cgraph->visited_hash_set.keys)
-            free(cgraph->visited_hash_set.keys);
-        if (cgraph->grads)
-            free(cgraph->grads);
-        free(cgraph);
-    }
-};
-
 struct encodec_context {
     encodec_model model;
 
     // computational graph stored on the heap to avoid stack overflows
     // the computational graph grows with the sequence length (because of the LSTM)
     // which requires a lot of nodes
-    std::unique_ptr<struct ggml_cgraph, encodec_ggml_cgraph_deleter> gf;
+    ggml_cgraph *gf;
 
     // buffer for model evaluation
     ggml_backend_buffer_t buf_compute;
@@ -209,30 +186,9 @@ bool encodec_load_model_weights(std::ifstream &infile, encodec_model &model, int
         }
     }
 
-#ifdef GGML_USE_CUBLAS
-    if (n_gpu_layers > 0) {
-        fprintf(stderr, "%s: using CUDA backend\n", __func__);
-        model.backend = ggml_backend_cuda_init();
-        if (!model.backend) {
-            fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
-        }
-    }
-#endif
-
-#ifdef GGML_USE_METAL
-    if (n_gpu_layers > 0) {
-        fprintf(stderr, "%s: using Metal backend\n", __func__);
-        model.backend = ggml_backend_metal_init();
-        if (!model.backend) {
-            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
-        }
-    }
-#endif
-
-    if (!model.backend) {
-        // fallback to CPU backend
-        fprintf(stderr, "%s: using CPU backend\n", __func__);
-        model.backend = ggml_backend_cpu_init();
+    if (!(model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr))) {
+        fprintf(stderr, "%s: ggml_backend_cpu_init() failed\n", __func__);
+        return false;
     }
 
     if (!model.backend) {
@@ -501,48 +457,6 @@ bool encodec_load_model_weights(std::ifstream &infile, encodec_model &model, int
     return true;
 }
 
-// Create a new ggml_cgraph with the given size (usually ENCODEC_MAX_NODES). We need a
-// custom function since the graph is so large, it overpasses the max built-in ggml
-// default size.
-static struct ggml_cgraph * encodec_ggml_cgraph_create(size_t size) {
-    struct ggml_cgraph * cgraph = (struct ggml_cgraph *)calloc(1, sizeof(struct ggml_cgraph));
-    cgraph->size = size;
-    cgraph->n_nodes = 0;
-    cgraph->n_leafs = 0;
-    cgraph->nodes = (struct ggml_tensor **)calloc(1, size * sizeof(struct ggml_tensor *));
-    cgraph->leafs = (struct ggml_tensor **)calloc(1, size * sizeof(struct ggml_tensor *));
-
-    // next primes after powers of two
-    static const size_t primes[] = {
-        2, 3, 5, 11, 17, 37, 67, 131, 257, 521, 1031,
-        2053, 4099, 8209, 16411, 32771, 65537, 131101,
-        262147, 524309, 1048583, 2097169, 4194319, 8388617,
-        16777259, 33554467, 67108879, 134217757, 268435459,
-        536870923, 1073741827, 2147483659
-    };
-    static const size_t n_primes = sizeof(primes)/sizeof(primes[0]);
-
-    // find the smallest prime that is larger or equal to size
-    size_t l = 0;
-    size_t r = n_primes;
-    while (l < r) {
-        size_t m = (l + r)/2;
-        if (primes[m] < size * 2) {
-            l = m + 1;
-        } else {
-            r = m;
-        }
-    }
-    size_t hash_size = l < n_primes ? primes[l] : (size * 2 + 1);
-
-    cgraph->visited_hash_set.size = hash_size;
-    cgraph->visited_hash_set.keys = (struct ggml_tensor **)calloc(1, hash_size * sizeof(struct ggml_tensor *));
-    cgraph->visited_hash_set.used = (ggml_bitset_t *)calloc(1, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t));
-    cgraph->order = GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT;
-
-    return cgraph;
-}
-
 void encodec_build_graph(struct encodec_context *ectx,
                          const float * inp_audio,
                          const int n_samples,
@@ -579,7 +493,7 @@ void encodec_build_graph(struct encodec_context *ectx,
 
     struct ggml_context *ctx0 = ggml_init(ggml_params);
 
-    gf = std::unique_ptr<struct ggml_cgraph, encodec_ggml_cgraph_deleter>(encodec_ggml_cgraph_create(ENCODEC_MAX_NODES));
+    gf = ggml_new_graph_custom(ctx0, ENCODEC_MAX_NODES, false);
 
     struct ggml_tensor *inp = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
     ggml_set_name(inp, "inp");
@@ -605,12 +519,12 @@ void encodec_build_graph(struct encodec_context *ectx,
         case encodec_run_mode_t::FULL: {
             ggml_set_name(decoded, "decoded");
             ggml_set_output(decoded);
-            ggml_build_forward_expand(gf.get(), decoded);
+            ggml_build_forward_expand(gf, decoded);
         } break;
         case encodec_run_mode_t::ENCODE: {
             ggml_set_name(codes, "codes");
             ggml_set_output(codes);
-            ggml_build_forward_expand(gf.get(), codes);
+            ggml_build_forward_expand(gf, codes);
         } break;
         case encodec_run_mode_t::DECODE: {
             assert(false);
@@ -668,7 +582,7 @@ void encodec_build_graph(struct encodec_context *ectx, const int32_t *codes,
 
     struct ggml_context *ctx0 = ggml_init(ggml_params);
 
-    gf = std::unique_ptr<struct ggml_cgraph, encodec_ggml_cgraph_deleter>(encodec_ggml_cgraph_create(ENCODEC_MAX_NODES));
+    gf = ggml_new_graph_custom(ctx0, ENCODEC_MAX_NODES, false);
 
     struct ggml_tensor *inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, N, n_q);
     ggml_set_name(inp_codes, "inp_codes");
@@ -689,7 +603,7 @@ void encodec_build_graph(struct encodec_context *ectx, const int32_t *codes,
         case encodec_run_mode_t::DECODE: {
             ggml_set_name(decoded, "decoded");
             ggml_set_output(decoded);
-            ggml_build_forward_expand(gf.get(), decoded);
+            ggml_build_forward_expand(gf, decoded);
         } break;
         default: {
             fprintf(stderr, "%s: unknown run mode\n", __func__);
@@ -718,34 +632,39 @@ bool encodec_eval_internal(struct encodec_context *ectx, const float * raw_audio
 
     encodec_build_graph(ectx, raw_audio, n_samples, mode);
 
+	ggml_gallocr_reserve(allocr, gf);
     // allocate the graph tensors
-    ggml_gallocr_alloc_graph(allocr, gf.get());
+    ggml_gallocr_alloc_graph(allocr, gf);
 
     // set the graph inputs
-    struct ggml_tensor * inp = ggml_graph_get_tensor(gf.get(), "inp");
+    struct ggml_tensor * inp = ggml_graph_get_tensor(gf, "inp");
     ggml_backend_tensor_set(inp, raw_audio, 0, n_samples * ggml_element_size(inp));
 
     // make sure accumulation tensor are zeroed
-    encodec_zero_tensor(gf.get(), "enc_l0_ht");
-    encodec_zero_tensor(gf.get(), "enc_l1_ht");
-    encodec_zero_tensor(gf.get(), "enc_l0_ct");
-    encodec_zero_tensor(gf.get(), "enc_l1_ct");
+    encodec_zero_tensor(gf, "enc_l0_ht");
+    encodec_zero_tensor(gf, "enc_l1_ht");
+    encodec_zero_tensor(gf, "enc_l0_ct");
+    encodec_zero_tensor(gf, "enc_l1_ct");
 
     if (mode == encodec_run_mode_t::FULL) {
-        encodec_zero_tensor(gf.get(), "dec_l0_ht");
-        encodec_zero_tensor(gf.get(), "dec_l1_ht");
-        encodec_zero_tensor(gf.get(), "dec_l0_ct");
-        encodec_zero_tensor(gf.get(), "dec_l1_ct");
+        encodec_zero_tensor(gf, "dec_l0_ht");
+        encodec_zero_tensor(gf, "dec_l1_ht");
+        encodec_zero_tensor(gf, "dec_l0_ct");
+        encodec_zero_tensor(gf, "dec_l1_ct");
 
-        encodec_zero_tensor(gf.get(), "quantized_out");
+        encodec_zero_tensor(gf, "quantized_out");
     }
 
     // run the computation
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+    if (ggml_backend_dev_type(ggml_backend_get_device(model.backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(model.backend));
+        auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (ggml_backend_set_n_threads_fn) {
+            ggml_backend_set_n_threads_fn(model.backend, n_threads);
+        }
     }
 
-    ggml_backend_graph_compute(model.backend, gf.get());
+    ggml_backend_graph_compute(model.backend, gf);
 
     return true;
 }
@@ -761,27 +680,32 @@ bool encodec_eval_internal(struct encodec_context *ectx, const int32_t *codes,
 
     encodec_build_graph(ectx, codes, n_codes, mode);
 
+	ggml_gallocr_reserve(allocr, gf);
     // allocate the graph tensors
-    ggml_gallocr_alloc_graph(allocr, gf.get());
+    ggml_gallocr_alloc_graph(allocr, gf);
 
     // set the graph inputs
-    struct ggml_tensor * inp = ggml_graph_get_tensor(gf.get(), "inp_codes");
+    struct ggml_tensor * inp = ggml_graph_get_tensor(gf, "inp_codes");
     ggml_backend_tensor_set(inp, codes, 0, n_codes * ggml_element_size(inp));
 
     // make sure accumulation tensors are zeroed
-    encodec_zero_tensor(gf.get(), "dec_l0_ht");
-    encodec_zero_tensor(gf.get(), "dec_l1_ht");
-    encodec_zero_tensor(gf.get(), "dec_l0_ct");
-    encodec_zero_tensor(gf.get(), "dec_l1_ct");
+    encodec_zero_tensor(gf, "dec_l0_ht");
+    encodec_zero_tensor(gf, "dec_l1_ht");
+    encodec_zero_tensor(gf, "dec_l0_ct");
+    encodec_zero_tensor(gf, "dec_l1_ct");
 
-    encodec_zero_tensor(gf.get(), "quantized_out");
+    encodec_zero_tensor(gf, "quantized_out");
 
     // run the computation
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+    if (ggml_backend_dev_type(ggml_backend_get_device(model.backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(model.backend));
+        auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (ggml_backend_set_n_threads_fn) {
+            ggml_backend_set_n_threads_fn(model.backend, n_threads);
+        }
     }
 
-    ggml_backend_graph_compute(model.backend, gf.get());
+    ggml_backend_graph_compute(model.backend, gf);
 
     return true;
 }
@@ -800,7 +724,7 @@ bool encodec_eval(struct encodec_context *ectx, const float *raw_audio,
         encodec_build_graph(ectx, raw_audio, n_samples, mode);
 
         // pre-allocate the compute buffer
-        ggml_gallocr_reserve(ectx->allocr, ectx->gf.get());
+        ggml_gallocr_reserve(ectx->allocr, ectx->gf);
         size_t mem_size = ggml_gallocr_get_buffer_size(ectx->allocr, 0);
         fprintf(stderr, "%s: compute buffer size: %.2f MB\n\n", __func__, mem_size / 1024.0 / 1024.0);
     }
@@ -830,7 +754,7 @@ bool encodec_eval(struct encodec_context *ectx, const int32_t *codes,
         encodec_build_graph(ectx, codes, n_codes, mode);
 
         // pre-allocate the compute buffer
-        ggml_gallocr_reserve(ectx->allocr, ectx->gf.get());
+        ggml_gallocr_reserve(ectx->allocr, ectx->gf);
         size_t mem_size = ggml_gallocr_get_buffer_size(ectx->allocr, 0);
         fprintf(stderr, "%s: compute buffer size: %.2f MB\n\n", __func__, mem_size / 1024.0 / 1024.0);
     }
